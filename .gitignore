@@ -1,0 +1,28 @@
+# ===== Python 运行环境（体积巨大，切勿上传）=====
+.venv/
+venv/
+env/
+.pyembed/
+
+# ===== Python 缓存 =====
+__pycache__/
+*.py[cod]
+*$py.class
+
+# ===== Streamlit 本地配置/缓存 =====
+.streamlit/
+
+# ===== 临时文件 / 测试残留 =====
+*.log
+sep_out/
+test_*.wav
+test_*.mp3
+clip.wav
+*_novocal.wav
+scan_result.*
+
+# ===== 系统 / 编辑器 =====
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
