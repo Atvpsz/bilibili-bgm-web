@@ -294,6 +294,7 @@ def identify(bvid, start, end, use_vocal_removal=True, progress=None):
         step("正在用 Shazam 识别…")
         title, artist = shazam_recognize(clip)
         used_vr = False
+        note_vr = ""  # 默认值，避免去人声重试仍未命中时变量未定义
 
         if not title and use_vocal_removal:
             if demucs_available():
