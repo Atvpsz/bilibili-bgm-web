@@ -198,111 +198,6 @@ def remove_vocals(mp3, workdir):
     return dst
 
 
-def extract_clean_bgm(mp3, workdir, min_seg=1.5, min_total=4.0, frame=0.5):
-    """智能提取『无人声解说的纯 BGM 微小片段』并拼接，返回拼接后的 wav 路径。
-
-    策略（区别于整段去人声）：
-      1. 用 Demucs 分离出 vocals 与伴奏（drums+bass+other）；
-      2. 对 vocals 做分帧能量检测，找出人声极低的区间（即无人声解说段）；
-      3. 把这些区间从『伴奏』中切出并拼接成一段连续音频；
-      4. 拼接总时长达到阈值才返回（否则说明整段都在说话，返回 None 让上层回退）。
-
-    这样直接跳过对话，送出的是纯净 BGM，避免了『对话盖住 BGM』和
-    『去人声残差太弱』两类问题。
-    """
-    if not demucs_available():
-        return None
-    import numpy as np
-    import torch
-    import torchaudio
-    from demucs.pretrained import get_model
-    from demucs.apply import apply_model
-    from demucs.audio import convert_audio
-
-    wav, sr = torchaudio.load(mp3)
-    device = "cpu"
-    model = get_model("htdemucs")
-    model.to(device).eval()
-    wav = convert_audio(wav, sr, model.samplerate, model.audio_channels)
-    ref = wav.mean(0)
-    mean = ref.mean()
-    std = ref.std()
-    wav = (wav - mean) / std
-
-    with torch.no_grad():
-        sources = apply_model(model, wav[None], device=device, progress=False)[0]
-
-    vocals_idx = model.sources.index("vocals")
-    vocals = sources[vocals_idx].cpu().numpy()[0]          # 单声道 (n,)
-    accompaniment = (sources.sum(0) - sources[vocals_idx])  # 伴奏
-    accompaniment = torch.clamp(accompaniment * std + mean, -1.0, 1.0).cpu()
-
-    sr_m = model.samplerate
-    hop = max(1, int(frame * sr_m))
-    n = len(vocals)
-    num_frames = max(1, n // hop)
-    # 分帧 RMS 能量
-    energies = np.array([
-        np.sqrt(np.mean(vocals[i * hop:(i + 1) * hop] ** 2))
-        for i in range(num_frames)
-    ])
-    # 自适应阈值：低于整体能量的 25% 分位的一半，即视为『无人声』
-    thresh = max(0.01, float(np.percentile(energies, 25)) * 0.5)
-    silent = energies < thresh
-
-    # 合并相邻静音帧为区间
-    segments = []
-    i = 0
-    while i < len(silent):
-        if silent[i]:
-            j = i
-            while j < len(silent) and silent[j]:
-                j += 1
-            t0, t1 = i * frame, j * frame
-            if t1 - t0 >= min_seg:
-                segments.append((t0, t1))
-            i = j
-        else:
-            i += 1
-
-    if not segments:
-        return None
-
-    chunks = []
-    total = 0.0
-    for t0, t1 in segments:
-        s0 = int(t0 * sr_m)
-        s1 = min(int(t1 * sr_m), accompaniment.shape[1])
-        if s1 <= s0:
-            continue
-        chunks.append(accompaniment[:, s0:s1])
-        total += (s1 - s0) / sr_m
-    if total < min_total or not chunks:
-        return None
-
-    merged = torch.cat(chunks, dim=1)
-    dst = os.path.join(workdir, "_clean_bgm.wav")
-    torchaudio.save(dst, merged.cpu(), sr_m)
-    return dst
-
-
-def boost_audio(src, dst):
-    """对音频做一次动态响度归一化，返回可送识的音频路径。
-
-    去人声后的残差 BGM 往往极轻（实测可低至 RMS≈0.02），Shazam 提取不到
-    指纹。dynaudnorm 会智能拉高低音量片段、同时尽量避免削波，比简单 volume
-    放大更稳。失败时回退到原文件，保证流程不中断。
-    """
-    ff = get_ffmpeg()
-    subprocess.run(
-        [ff, "-y", "-i", src, "-af", "dynaudnorm", dst],
-        capture_output=True,
-    )
-    if not os.path.exists(dst) or os.path.getsize(dst) < 2000:
-        return src
-    return dst
-
-
 # ---------- 识别 ----------
 async def _recognize_async(mp3):
     shazam = Shazam()
@@ -401,31 +296,15 @@ def identify(bvid, start, end, use_vocal_removal=True, progress=None):
         used_vr = False
         note_vr = ""  # 默认值，避免去人声重试仍未命中时变量未定义
 
-        if not title and use_vocal_removal and demucs_available():
-            # 策略1（优先）：自动提取无人声的纯 BGM 片段拼接送识
-            step("直接识别未命中，正在自动提取纯 BGM 片段…")
-            clean = extract_clean_bgm(clip, workdir)
-            if clean:
-                used_vr = True
-                title, artist = shazam_recognize(clean)
-                note_vr = "（已自动提取无人声片段拼接识别）"
-            else:
-                # 策略2（回退）：未检测到足够纯净片段时，整段去人声 + 增强
-                no_clean_reason = "该区间全程为对话，未检测到足够长的纯净 BGM 片段"
-                step("未检测到足够纯净片段，改用整段去人声重试…")
+        if not title and use_vocal_removal:
+            if demucs_available():
+                step("直接识别未命中，正在去人声后重试…")
                 nv = remove_vocals(clip, workdir)
                 if nv:
                     used_vr = True
-                    nv_boost = os.path.join(workdir, "_novocal_boost.wav")
-                    nv_for_shazam = boost_audio(nv, nv_boost)
-                    title, artist = shazam_recognize(nv_for_shazam)
-                    note_vr = "（已自动去人声）"
-                else:
-                    note_vr = ""
-                if not title:
-                    note_vr = f"（{no_clean_reason}，已尝试去人声仍未能识别，建议换对话较少的时段）"
-        elif not title and use_vocal_removal and not demucs_available():
-            note_vr = "（已开启去人声，但服务端未安装 Demucs，跳过）"
+                    title, artist = shazam_recognize(nv)
+            else:
+                note_vr = "（已开启去人声，但服务端未安装 Demucs，跳过）"
         else:
             note_vr = ""
 
