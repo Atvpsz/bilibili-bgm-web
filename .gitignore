@@ -26,3 +26,6 @@ scan_result.*
 Thumbs.db
 .idea/
 .vscode/
+
+# ===== 作业资料 / 非项目文件（不上传仓库，仅本地保留）=====
+工程导论_AI协作记录.docx
