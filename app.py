@@ -72,6 +72,8 @@ if submitted:
         e_sec = bgm_core.parse_time(end)
         if s_sec is None or e_sec is None:
             st.error("时间格式无法识别，请参考示例（1:30 / 90 / 1分30秒）")
+        elif s_sec < 0 or e_sec < 0:
+            st.error("时间不能为负数，请参考示例（1:30 / 90 / 1分30秒）")
         elif e_sec <= s_sec:
             st.error("结束时间必须大于起始时间")
         else:

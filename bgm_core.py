@@ -8,9 +8,11 @@ B 站视频「指定时间段 BGM」识别核心逻辑（供 Streamlit 网页调
                          识别某视频 [start, end] 秒区间内的 BGM
                          返回 dict: {"title","artist","used_vocal_removal","note"}
 
-识别流程：
-  1. WBI 签名获取播放地址 -> 下载区间所需音频（仅 0 ~ end+5 秒）
-  2. 用 ffmpeg 切出 [start, end] 区间
+识别流程（遵循「快速失败」原则：校验失败时立即返回，不进入下载/识别）：
+  0. 参数合法性校验（时间格式、负数、区间范围）—— 纯本地，立即失败
+  1. 连接 B 站并解析视频（resolve_bvid + view 接口拿视频总时长），
+     先验证 BV/AV 号有效、区间不超出视频长度，再决定是否下载
+  2. 仅下载区间所需音频（0 ~ end+5 秒），用 ffmpeg 切出 [start, end] 区间
   3. 直接交给 Shazam 识别；若被解说/对话盖住识别失败，且用户开启了
      “去人声”，则自动用 Demucs 分离人声后再识别一次
 """
@@ -89,24 +91,45 @@ def resolve_bvid(raw, h):
         return raw
     m = re.search(r"\d+", raw)
     if not m:
-        return raw
+        return None
     aid = m.group(0)
-    v = httpx.get("https://api.bilibili.com/x/web-interface/view",
-                  params={"aid": aid}, headers=h, timeout=15).json()
-    return v["data"]["bvid"]
+    try:
+        v = httpx.get("https://api.bilibili.com/x/web-interface/view",
+                      params={"aid": aid}, headers=h, timeout=15).json()
+    except Exception:
+        return None
+    data = v.get("data")
+    if not data:
+        return None
+    return data.get("bvid")
 
 
-def get_audio_url(bvid, sign, h):
-    v = httpx.get("https://api.bilibili.com/x/web-interface/view",
-                  params={"bvid": bvid}, headers=h, timeout=15).json()
-    cid = v["data"]["cid"]
+def get_play_info(bvid, sign, h):
+    """返回 (url, cid, bandwidth, duration)。
+
+    视频不可访问 / 不存在 / 受版权限制时，返回 (None, None, None, None)。
+    通过 view 接口一次性拿到视频总时长与 cid，便于在下载前校验时间段。
+    """
+    try:
+        v = httpx.get("https://api.bilibili.com/x/web-interface/view",
+                      params={"bvid": bvid}, headers=h, timeout=15).json()
+    except Exception:
+        return (None, None, None, None)
+    data = v.get("data")
+    if not data or not data.get("cid"):
+        return (None, None, None, None)
+    cid = data["cid"]
+    duration = data.get("duration") or 0
     p = sign({"bvid": bvid, "cid": cid, "qn": "16", "fnval": "16",
               "fnver": "0", "fourk": "1", "platform": "pc",
               "web_location": 1315875})
-    r = httpx.get("https://api.bilibili.com/x/player/wbi/playurl",
-                  params=p, headers=h, timeout=15).json()
-    audio = r["data"]["dash"]["audio"][0]
-    return audio["baseUrl"], cid, audio.get("bandwidth", 128000)
+    try:
+        r = httpx.get("https://api.bilibili.com/x/player/wbi/playurl",
+                      params=p, headers=h, timeout=15).json()
+        audio = r["data"]["dash"]["audio"][0]
+    except Exception:
+        return (None, None, None, None)
+    return audio["baseUrl"], cid, audio.get("bandwidth", 128000), duration
 
 
 # ---------- 下载 / 切片 ----------
@@ -296,16 +319,50 @@ def parse_time(s):
 
 
 # ---------- 主流程 ----------
+def _fail(note):
+    """构造「校验失败」的统一返回结构，供 identify 在各阶段早退、快速失败。"""
+    return {"title": None, "artist": None,
+            "used_vocal_removal": False, "note": note}
+
+
 def identify(bvid, start, end, use_vocal_removal=True, progress=None):
     def step(msg):
         if progress:
             progress(msg)
 
-    step("正在连接 B 站并解析视频…")
-    sign, h = wbi_sign()
-    bvid = resolve_bvid(bvid, h)
-    url, _, bw = get_audio_url(bvid, sign, h)
+    # ===== 阶段 0：参数合法性校验（无需联网，立即失败）=====
+    if start is None or end is None:
+        return _fail("时间格式无法识别，请参考示例（1:30 / 90 / 1分30秒）。")
+    if start < 0:
+        return _fail("起始时间不能为负数。")
+    if end <= start:
+        return _fail("结束时间必须大于起始时间。")
+    if end - start < 1:
+        return _fail("识别区间至少需要 1 秒，请拉大时间范围。")
+    if end - start > 600:
+        return _fail("识别区间过长（上限 600 秒），请缩短时间范围后重试。")
 
+    # ===== 阶段 1：连接 B 站并解析视频（下载前先验证可访问性）=====
+    step("正在校验视频与时间段…")
+    try:
+        sign, h = wbi_sign()
+        bvid = resolve_bvid(bvid, h)
+        if not bvid:
+            return _fail("⚠️ 该 AV 号无法解析或视频不存在，请检查后重试。")
+        url, _, bw, duration = get_play_info(bvid, sign, h)
+        if url is None:
+            return _fail(
+                "⚠️ 该 BV/AV 号无法识别、视频不存在或受版权限制，请检查后重试。")
+    except Exception:
+        return _fail("⚠️ 无法连接 B 站接口（可能是网络问题），请稍后重试。")
+
+    # 区间不可超出视频总时长（用 B 站官方时长，不必下载即可判断）
+    if duration and end > duration:
+        return _fail(
+            f"⚠️ 时间段超出视频长度（视频总时长 {mmss(duration)}），"
+            f"请将结束时间调整到 {mmss(duration)} 以内。")
+
+    # ===== 阶段 2：下载并识别 =====
     # 只下载到区间终点（含余量），避免拉整段
     need_sec = end + 5
     needed = int(need_sec * bw / 8) + 300_000
@@ -313,13 +370,12 @@ def identify(bvid, start, end, use_vocal_removal=True, progress=None):
     full = download_audio(url, h, needed)
     try:
         dur = get_duration(full) or 0
+        # 兜底：以实际音频时长为准再次校验（理论上不会触发）
         if dur and end > dur:
-            step(f"区间超出视频时长，已自动截断到 {mmss(dur)}")
+            step(f"区间超出音频实际时长，已截断到 {mmss(dur)}")
             end = dur
         if start >= end:
-            return {"title": None, "artist": None,
-                    "used_vocal_removal": False,
-                    "note": "起始时间须小于结束时间。"}
+            return _fail("起始时间须小于结束时间。")
 
         workdir = tempfile.mkdtemp()
         # 切片用 wav：demucs 读取时走 soundfile 后端，避免依赖 ffmpeg/ffprobe
