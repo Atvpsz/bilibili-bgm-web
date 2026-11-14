@@ -199,7 +199,7 @@ def remove_vocals(mp3, workdir):
 
 
 # ---------- 识别 ----------
-async def _recognize_async(mp3):
+async def _recognize_once_async(mp3):
     shazam = Shazam()
     try:
         return await shazam.recognize(mp3)
@@ -210,20 +210,59 @@ async def _recognize_async(mp3):
             pass
 
 
-def shazam_recognize(mp3):
-    for _ in range(3):
+def _parse_shazam(res):
+    """从 Shazam 返回里抠出 (歌名, 歌手)，无结果返回 (None, None)。"""
+    track = res.get("track") if isinstance(res, dict) else None
+    if not track:
+        return None, None
+    title = track.get("title")
+    artist = track.get("subtitle") or (
+        track.get("artists") and track["artists"][0].get("name"))
+    if not title:
+        return None, None
+    return title, artist
+
+
+def shazam_recognize(mp3, n=3):
+    """对同一段音频连续识别 n 次并用「多数投票」决定最终歌名。
+
+    背景：Shazam 对被人声盖住、指纹很弱的片段，单次识别结果不稳定
+    （同一输入多次调用可能给出不同甚至错误的匹配）。多识别几次取
+    最高票，可以显著降低这种随机性、提升稳定性。
+
+    返回 (title, artist, confident, status)：
+      - title/artist 为多数票结果；若 n 次全无结果则为 (None, None, False, status)
+      - confident=True 表示最高票出现 >= 2 次（结果较可信）；
+        若 n 次结果互不相同（如各 1 票），confident=False，提示可能不准
+      - status 细化失败原因，便于向用户给出可操作的提示：
+          "ok"        请求成功且有识别结果
+          "no_match"  请求均成功返回，但 Shazam 未匹配到任何歌曲
+                     （曲库未收录此曲 / 人声遮挡过重 / 片段过短）
+          "error"     全部请求都因网络或服务异常失败
+                     （Shazam 服务器不可达，常见于中国大陆网络环境）
+    """
+    from collections import Counter
+    votes = []
+    errors = 0
+    for i in range(n):
         try:
-            res = asyncio.run(_recognize_async(mp3))
-            track = res.get("track") if isinstance(res, dict) else None
-            if track:
-                title = track.get("title")
-                artist = track.get("subtitle") or (
-                    track.get("artists") and track["artists"][0].get("name"))
-                if title:
-                    return title, artist
+            res = asyncio.run(_recognize_once_async(mp3))
+            title, artist = _parse_shazam(res)
+            if title:
+                votes.append((title, artist))
+            # 注意：请求成功但无 track，也算一次有效「无匹配」
         except Exception:
-            time.sleep(2)
-    return None, None
+            errors += 1
+        if i < n - 1:
+            time.sleep(1)  # 轻微间隔，避免请求过于密集被限流
+    if votes:
+        best, cnt = Counter(votes).most_common(1)[0]
+        confident = cnt >= 2 or n == 1
+        return best[0], best[1], confident, "ok"
+    # 没有任何有效匹配：进一步细分是「连不上」还是「连上但无结果」
+    if errors == n:
+        return None, None, False, "error"
+    return None, None, False, "no_match"
 
 
 def mmss(sec):
@@ -291,22 +330,21 @@ def identify(bvid, start, end, use_vocal_removal=True, progress=None):
                     "used_vocal_removal": False,
                     "note": "音频截取失败，可能区间过短或该视频有版权限制。"}
 
-        step("正在用 Shazam 识别…")
-        title, artist = shazam_recognize(clip)
+        step("正在用 Shazam 识别（多轮投票）…")
+        title, artist, confident, status = shazam_recognize(clip, n=3)
         used_vr = False
-        note_vr = ""  # 默认值，避免去人声重试仍未命中时变量未定义
+        note_vr = ""
 
-        if not title and use_vocal_removal:
+        if not title and status == "no_match" and use_vocal_removal:
+            # 服务正常但无匹配：去人声可能让 BGM 更清晰，值得再试一次
             if demucs_available():
                 step("直接识别未命中，正在去人声后重试…")
                 nv = remove_vocals(clip, workdir)
                 if nv:
                     used_vr = True
-                    title, artist = shazam_recognize(nv)
+                    title, artist, confident, status = shazam_recognize(nv, n=3)
             else:
                 note_vr = "（已开启去人声，但服务端未安装 Demucs，跳过）"
-        else:
-            note_vr = ""
 
         # 清理临时文件
         try:
@@ -318,8 +356,19 @@ def identify(bvid, start, end, use_vocal_removal=True, progress=None):
             note = f"识别成功。区间 {mmss(start)}-{mmss(end)}"
             if used_vr:
                 note += "（已自动去人声）"
+            if not confident:
+                note += "　⚠️ 多次识别结果不一致，结果可能不准，建议重试"
         else:
-            note = "未识别到匹配的 BGM。" + (note_vr if use_vocal_removal else "")
+            # 未识别到：按失败原因给出更精确、可操作的提示
+            if status == "error":
+                note = "⚠️ 识别服务暂时连不上（可能是网络问题），请稍后重试。"
+            elif status == "no_match":
+                note = ("未匹配到 BGM。可能原因：Shazam 曲库未收录此曲 / "
+                        "该片段人声遮挡过重 / 片段过短。")
+                if use_vocal_removal and not demucs_available():
+                    note += note_vr
+            else:
+                note = "未识别到匹配的 BGM。"
         return {"title": title, "artist": artist,
                 "used_vocal_removal": used_vr, "note": note}
     finally:
