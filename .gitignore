@@ -32,3 +32,5 @@ Thumbs.db
 
 # ===== Streamlit 自动生成的开发容器配置（部署不需要）=====
 .devcontainer/
+#=====测试样本======
+测试样本.txt
