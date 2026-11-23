@@ -4,7 +4,7 @@
 
 ## 如何使用
 
-1. 打开网页应用https://bilibili-bgm-web-atvpsz.streamlit.app/
+1. 打开网页应用https://bilibili-bgm-web-atvpsz.streamlit.app
 2. 填写 **视频 BV 号 / AV 号**，支持以下形式：
    - `BV16dJv6nEJH`（完整 BV 号）
    - `AV123456` 或纯数字 `123456`（AV 号）
